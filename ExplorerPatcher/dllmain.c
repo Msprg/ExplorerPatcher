@@ -1185,61 +1185,91 @@ BOOL CTaskBtnGroup_IsFlashingHook(ITaskBtnGroup* _this)
     return CTaskBtnGroup_IsFlashingFunc(_this);
 }
 
-HRESULT (*CTaskListWnd_RedrawTaskFunc)(void* _this, void* pTaskGroup, void* pTaskItem, DWORD dwFlags) = NULL;
-HRESULT CTaskListWnd_RedrawTaskHook(void* _this, void* pTaskGroup, void* pTaskItem, DWORD dwFlags)
-{
-    void* pPrevRedrawTaskItem = g_pRedrawTaskItem;
-    g_pRedrawTaskItem = pTaskItem;
-    HRESULT hr = CTaskListWnd_RedrawTaskFunc(_this, pTaskGroup, pTaskItem, dwFlags);
-    g_pRedrawTaskItem = pPrevRedrawTaskItem;
-    return hr;
-}
-
-// For AUTOHIDEFLASH_SHOWONCE: an item's flashing episode lasts while its blinks keep coming within this time.
-// Blinks normally come every 2 * GetCaretBlinkTime() (~1 s); the window is extended on suppressed blinks too.
-#define AUTOHIDEFLASH_EPISODE_TIMEOUT 5000
+// For AUTOHIDEFLASH_SHOWONCE: the tray is unhidden at most once per flashing episode of an item. An episode lasts
+// while the item keeps receiving "flash on" notifications (HSHELL_FLASH -> RedrawTask() with flag 2) within this
+// time. Those don't arrive at a steady rate for busy/background apps, and only some of them actually toggle the
+// button (and so unhide the tray), so the episode is tracked from every notification rather than from unhides.
+#define AUTOHIDEFLASH_EPISODE_TIMEOUT 10000
 
 typedef struct _AUTOHIDEFLASH_ITEM
 {
     void* pTaskItem; // Only compared, never dereferenced
-    DWORD dwLastBlinkTick;
+    DWORD dwLastFlashTick;
+    BOOL bUnhidden;
 } AUTOHIDEFLASH_ITEM;
 
 static AUTOHIDEFLASH_ITEM g_autoHideFlashItems[16];
 static SRWLOCK g_autoHideFlashItemsLock = SRWLOCK_INIT;
 
-BOOL Win10TaskbarHooks_IsInFlashingEpisode(void* pTaskItem)
+// Must be called with g_autoHideFlashItemsLock held
+static AUTOHIDEFLASH_ITEM* Win10TaskbarHooks_FindFlashItem(void* pTaskItem)
 {
-    BOOL bInEpisode = FALSE;
-    DWORD dwNow = GetTickCount();
-    AcquireSRWLockExclusive(&g_autoHideFlashItemsLock);
-    AUTOHIDEFLASH_ITEM* pEntry = NULL;
-    AUTOHIDEFLASH_ITEM* pOldest = &g_autoHideFlashItems[0];
     for (SIZE_T i = 0; i < ARRAYSIZE(g_autoHideFlashItems); ++i)
     {
-        AUTOHIDEFLASH_ITEM* pItem = &g_autoHideFlashItems[i];
-        if (pItem->pTaskItem == pTaskItem)
+        if (g_autoHideFlashItems[i].pTaskItem == pTaskItem)
         {
-            pEntry = pItem;
-            break;
-        }
-        if (!pItem->pTaskItem || dwNow - pItem->dwLastBlinkTick > dwNow - pOldest->dwLastBlinkTick)
-        {
-            pOldest = pItem;
+            return &g_autoHideFlashItems[i];
         }
     }
+    return NULL;
+}
+
+void Win10TaskbarHooks_OnFlashNotification(void* pTaskItem)
+{
+    DWORD dwNow = GetTickCount();
+    AcquireSRWLockExclusive(&g_autoHideFlashItemsLock);
+    AUTOHIDEFLASH_ITEM* pEntry = Win10TaskbarHooks_FindFlashItem(pTaskItem);
+    if (!pEntry || dwNow - pEntry->dwLastFlashTick >= AUTOHIDEFLASH_EPISODE_TIMEOUT)
+    {
+        if (!pEntry)
+        {
+            pEntry = &g_autoHideFlashItems[0];
+            for (SIZE_T i = 1; i < ARRAYSIZE(g_autoHideFlashItems); ++i)
+            {
+                AUTOHIDEFLASH_ITEM* pItem = &g_autoHideFlashItems[i];
+                if (!pEntry->pTaskItem)
+                {
+                    break;
+                }
+                if (!pItem->pTaskItem || dwNow - pItem->dwLastFlashTick > dwNow - pEntry->dwLastFlashTick)
+                {
+                    pEntry = pItem;
+                }
+            }
+            pEntry->pTaskItem = pTaskItem;
+        }
+        pEntry->bUnhidden = FALSE; // New episode
+    }
+    pEntry->dwLastFlashTick = dwNow;
+    ReleaseSRWLockExclusive(&g_autoHideFlashItemsLock);
+}
+
+BOOL Win10TaskbarHooks_ShouldSuppressFlashUnhide(void* pTaskItem)
+{
+    BOOL bSuppress = FALSE;
+    AcquireSRWLockExclusive(&g_autoHideFlashItemsLock);
+    AUTOHIDEFLASH_ITEM* pEntry = Win10TaskbarHooks_FindFlashItem(pTaskItem);
     if (pEntry)
     {
-        bInEpisode = dwNow - pEntry->dwLastBlinkTick < AUTOHIDEFLASH_EPISODE_TIMEOUT;
+        bSuppress = pEntry->bUnhidden;
+        pEntry->bUnhidden = TRUE;
     }
-    else
-    {
-        pEntry = pOldest;
-        pEntry->pTaskItem = pTaskItem;
-    }
-    pEntry->dwLastBlinkTick = dwNow;
     ReleaseSRWLockExclusive(&g_autoHideFlashItemsLock);
-    return bInEpisode;
+    return bSuppress;
+}
+
+HRESULT (*CTaskListWnd_RedrawTaskFunc)(void* _this, void* pTaskGroup, void* pTaskItem, DWORD dwFlags) = NULL;
+HRESULT CTaskListWnd_RedrawTaskHook(void* _this, void* pTaskGroup, void* pTaskItem, DWORD dwFlags)
+{
+    if (pTaskItem && (dwFlags & 2) && dwTaskbarAutohideFlashBehavior == AUTOHIDEFLASH_SHOWONCE)
+    {
+        Win10TaskbarHooks_OnFlashNotification(pTaskItem);
+    }
+    void* pPrevRedrawTaskItem = g_pRedrawTaskItem;
+    g_pRedrawTaskItem = pTaskItem;
+    HRESULT hr = CTaskListWnd_RedrawTaskFunc(_this, pTaskGroup, pTaskItem, dwFlags);
+    g_pRedrawTaskItem = pPrevRedrawTaskItem;
+    return hr;
 }
 
 HRESULT (*CTaskBand_UnhideTrayFunc)(void* _this) = NULL;
@@ -1250,7 +1280,7 @@ HRESULT CTaskBand_UnhideTrayHook(void* _this)
     {
         DWORD dwBehavior = dwTaskbarAutohideFlashBehavior;
         if (dwBehavior == AUTOHIDEFLASH_NEVERSHOW
-            || (dwBehavior == AUTOHIDEFLASH_SHOWONCE && Win10TaskbarHooks_IsInFlashingEpisode(g_pRedrawTaskItem)))
+            || (dwBehavior == AUTOHIDEFLASH_SHOWONCE && Win10TaskbarHooks_ShouldSuppressFlashUnhide(g_pRedrawTaskItem)))
         {
             return S_OK;
         }
