@@ -103,6 +103,7 @@ DWORD dwTaskbarAl = 1;
 DWORD bShowUpdateToast = FALSE;
 DWORD bToolbarSeparators = FALSE;
 DWORD bTaskbarAutohideOnDoubleClick = FALSE;
+DWORD bTaskbarAutohideIgnoreFlashing = FALSE;
 DWORD dwOrbStyle = 0;
 DWORD bEnableSymbolDownload = TRUE;
 DWORD dwAltTabSettings = 0;
@@ -1146,6 +1147,64 @@ void Win10TaskbarHooks_PatchEPTaskbarVtables(HMODULE hModule)
     if (pTaskBtnGroupVtbl)
     {
         Win10TaskbarHooks_ConditionalPatchITaskBtnGroupVtbl(pTaskBtnGroupVtbl);
+    }
+}
+
+// TrayUI::_ShouldAutoHideTray() asks the task band whether it may hide (OLECMD 7), which ends up in
+// CTaskListWnd::PermitAutoHide(). That refuses as long as any button group reports IsFlashing(), so an app that
+// requests attention (e.g. Microsoft Teams) keeps an auto-hidden taskbar shown until its window is activated.
+// We only fake IsFlashing() while inside PermitAutoHide(), so buttons are still drawn as flashing/highlighted.
+static __declspec(thread) BOOL g_bInPermitAutoHide = FALSE;
+
+BOOL (*CTaskListWnd_PermitAutoHideFunc)(void* _this) = NULL;
+BOOL CTaskListWnd_PermitAutoHideHook(void* _this)
+{
+    BOOL bWasInPermitAutoHide = g_bInPermitAutoHide;
+    g_bInPermitAutoHide = TRUE;
+    BOOL bRet = CTaskListWnd_PermitAutoHideFunc(_this);
+    g_bInPermitAutoHide = bWasInPermitAutoHide;
+    return bRet;
+}
+
+BOOL (*CTaskBtnGroup_IsFlashingFunc)(ITaskBtnGroup* _this) = NULL;
+BOOL CTaskBtnGroup_IsFlashingHook(ITaskBtnGroup* _this)
+{
+    if (bTaskbarAutohideIgnoreFlashing && g_bInPermitAutoHide)
+    {
+        return FALSE;
+    }
+    return CTaskBtnGroup_IsFlashingFunc(_this);
+}
+
+void Win10TaskbarHooks_HookEPTaskbarAutoHide(HMODULE hModule)
+{
+    CTaskListWnd_PermitAutoHideFunc = (BOOL(*)(void*))GetProcAddress(hModule, "?PermitAutoHide@CTaskListWnd@@UEAAHXZ");
+    CTaskBtnGroup_IsFlashingFunc = (BOOL(*)(ITaskBtnGroup*))GetProcAddress(hModule, "?IsFlashing@CTaskBtnGroup@@UEAAHXZ");
+    if (!CTaskListWnd_PermitAutoHideFunc || !CTaskBtnGroup_IsFlashingFunc)
+    {
+        printf("[TB] CTaskListWnd::PermitAutoHide() or CTaskBtnGroup::IsFlashing() not exported\n");
+        return;
+    }
+
+    int rv = funchook_prepare(
+        funchook,
+        (void**)&CTaskBtnGroup_IsFlashingFunc,
+        CTaskBtnGroup_IsFlashingHook
+    );
+    if (rv != 0)
+    {
+        printf("[TB] Failed to hook CTaskBtnGroup::IsFlashing()\n");
+        return;
+    }
+
+    rv = funchook_prepare(
+        funchook,
+        (void**)&CTaskListWnd_PermitAutoHideFunc,
+        CTaskListWnd_PermitAutoHideHook
+    );
+    if (rv != 0)
+    {
+        printf("[TB] Failed to hook CTaskListWnd::PermitAutoHide()\n");
     }
 }
 #endif
@@ -6157,6 +6216,15 @@ void WINAPI LoadSettings(LPARAM lParam)
             0,
             NULL,
             &bTaskbarAutohideOnDoubleClick,
+            &dwSize
+        );
+        dwSize = sizeof(DWORD);
+        RegQueryValueExW(
+            hKey,
+            TEXT("TaskbarAutohideIgnoreFlashing"),
+            0,
+            NULL,
+            &bTaskbarAutohideIgnoreFlashing,
             &dwSize
         );
         dwTemp = ORB_STYLE_WINDOWS10;
@@ -11211,6 +11279,7 @@ DWORD Inject(BOOL bIsExplorer)
         VnPatchIAT(hMyTaskbar, "uxtheme.dll", MAKEINTRESOURCEA(126), PeopleBand_DrawTextWithGlowHook);
 
         Win10TaskbarHooks_PatchEPTaskbarVtables(hMyTaskbar);
+        Win10TaskbarHooks_HookEPTaskbarAutoHide(hMyTaskbar);
     }
 
     HANDLE hCombase = LoadLibraryExW(L"combase.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
