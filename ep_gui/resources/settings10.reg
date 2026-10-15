@@ -45,8 +45,11 @@
 ;b %R:1026%
 ;"Virtualized_{D17F1E1A-5919-4427-8F89-A1A8503CA3EB}_AutoHideTaskbar"=dword:00000000
 ;s Taskbar_AutoHideFlashingSection IsAltImplTaskbar
-;b %R:1049%
-"TaskbarAutohideIgnoreFlashing"=dword:00000000
+;c 3 %R:1049%
+;x 0 %R:1050%
+;x 1 %R:1051%
+;x 2 %R:1052%
+"TaskbarAutohideFlashBehavior"=dword:00000000
 ;g Taskbar_AutoHideFlashingSection
 [HKEY_CURRENT_USER\Software\ExplorerPatcher]
 ;c 2 %R:1027% *
