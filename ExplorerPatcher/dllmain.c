@@ -104,6 +104,7 @@ DWORD dwTaskbarAl = 1;
 DWORD bShowUpdateToast = FALSE;
 DWORD bToolbarSeparators = FALSE;
 DWORD bTaskbarAutohideOnDoubleClick = FALSE;
+DWORD dwTaskbarAutohideFlashBehavior = 0;
 DWORD dwOrbStyle = 0;
 DWORD bEnableSymbolDownload = TRUE;
 DWORD dwAltTabSettings = 0;
@@ -1147,6 +1148,201 @@ void Win10TaskbarHooks_PatchEPTaskbarVtables(HMODULE hModule)
     if (pTaskBtnGroupVtbl)
     {
         Win10TaskbarHooks_ConditionalPatchITaskBtnGroupVtbl(pTaskBtnGroupVtbl);
+    }
+}
+
+// How an auto-hidden taskbar reacts to apps flashing their buttons for attention (e.g. Microsoft Teams):
+// - TrayUI::_ShouldAutoHideTray() asks the task band whether it may hide (OLECMD 7), which ends up in
+//   CTaskListWnd::PermitAutoHide(). That refuses as long as any button group reports IsFlashing(), so the taskbar
+//   stays shown until the flashing window is activated. We only fake IsFlashing() while inside PermitAutoHide(), so
+//   buttons are still drawn as flashing/highlighted.
+// - CTaskListWnd::RedrawTask() calls ITaskListWndSite::UnhideTray() (CTaskBand::UnhideTray()) on every "flash on"
+//   blink, so once the taskbar is allowed to hide, it would pop up again with every blink.
+#define AUTOHIDEFLASH_DEFAULT 0
+#define AUTOHIDEFLASH_SHOWONCE 1
+#define AUTOHIDEFLASH_NEVERSHOW 2
+
+static __declspec(thread) BOOL g_bInPermitAutoHide = FALSE;
+static __declspec(thread) void* g_pRedrawTaskItem = NULL;
+
+BOOL (*CTaskListWnd_PermitAutoHideFunc)(void* _this) = NULL;
+BOOL CTaskListWnd_PermitAutoHideHook(void* _this)
+{
+    BOOL bWasInPermitAutoHide = g_bInPermitAutoHide;
+    g_bInPermitAutoHide = TRUE;
+    BOOL bRet = CTaskListWnd_PermitAutoHideFunc(_this);
+    g_bInPermitAutoHide = bWasInPermitAutoHide;
+    return bRet;
+}
+
+BOOL (*CTaskBtnGroup_IsFlashingFunc)(ITaskBtnGroup* _this) = NULL;
+BOOL CTaskBtnGroup_IsFlashingHook(ITaskBtnGroup* _this)
+{
+    DWORD dwBehavior = dwTaskbarAutohideFlashBehavior;
+    if ((dwBehavior == AUTOHIDEFLASH_SHOWONCE || dwBehavior == AUTOHIDEFLASH_NEVERSHOW) && g_bInPermitAutoHide)
+    {
+        return FALSE;
+    }
+    return CTaskBtnGroup_IsFlashingFunc(_this);
+}
+
+// For AUTOHIDEFLASH_SHOWONCE: the tray is unhidden at most once per flashing episode of an item. An episode lasts
+// while the item keeps receiving "flash on" notifications (HSHELL_FLASH -> RedrawTask() with flag 2) within this
+// time. Those don't arrive at a steady rate for busy/background apps, and only some of them actually toggle the
+// button (and so unhide the tray), so the episode is tracked from every notification rather than from unhides.
+#define AUTOHIDEFLASH_EPISODE_TIMEOUT 10000
+
+typedef struct _AUTOHIDEFLASH_ITEM
+{
+    void* pTaskItem; // Only compared, never dereferenced
+    DWORD dwLastFlashTick;
+    BOOL bUnhidden;
+} AUTOHIDEFLASH_ITEM;
+
+static AUTOHIDEFLASH_ITEM g_autoHideFlashItems[16];
+static SRWLOCK g_autoHideFlashItemsLock = SRWLOCK_INIT;
+
+// Must be called with g_autoHideFlashItemsLock held
+static AUTOHIDEFLASH_ITEM* Win10TaskbarHooks_FindFlashItem(void* pTaskItem)
+{
+    for (SIZE_T i = 0; i < ARRAYSIZE(g_autoHideFlashItems); ++i)
+    {
+        if (g_autoHideFlashItems[i].pTaskItem == pTaskItem)
+        {
+            return &g_autoHideFlashItems[i];
+        }
+    }
+    return NULL;
+}
+
+void Win10TaskbarHooks_OnFlashNotification(void* pTaskItem)
+{
+    DWORD dwNow = GetTickCount();
+    AcquireSRWLockExclusive(&g_autoHideFlashItemsLock);
+    AUTOHIDEFLASH_ITEM* pEntry = Win10TaskbarHooks_FindFlashItem(pTaskItem);
+    if (!pEntry || dwNow - pEntry->dwLastFlashTick >= AUTOHIDEFLASH_EPISODE_TIMEOUT)
+    {
+        if (!pEntry)
+        {
+            pEntry = &g_autoHideFlashItems[0];
+            for (SIZE_T i = 1; i < ARRAYSIZE(g_autoHideFlashItems); ++i)
+            {
+                AUTOHIDEFLASH_ITEM* pItem = &g_autoHideFlashItems[i];
+                if (!pEntry->pTaskItem)
+                {
+                    break;
+                }
+                if (!pItem->pTaskItem || dwNow - pItem->dwLastFlashTick > dwNow - pEntry->dwLastFlashTick)
+                {
+                    pEntry = pItem;
+                }
+            }
+            pEntry->pTaskItem = pTaskItem;
+        }
+        pEntry->bUnhidden = FALSE; // New episode
+    }
+    pEntry->dwLastFlashTick = dwNow;
+    ReleaseSRWLockExclusive(&g_autoHideFlashItemsLock);
+}
+
+BOOL Win10TaskbarHooks_ShouldSuppressFlashUnhide(void* pTaskItem)
+{
+    BOOL bSuppress = FALSE;
+    AcquireSRWLockExclusive(&g_autoHideFlashItemsLock);
+    AUTOHIDEFLASH_ITEM* pEntry = Win10TaskbarHooks_FindFlashItem(pTaskItem);
+    if (pEntry)
+    {
+        bSuppress = pEntry->bUnhidden;
+        pEntry->bUnhidden = TRUE;
+    }
+    ReleaseSRWLockExclusive(&g_autoHideFlashItemsLock);
+    return bSuppress;
+}
+
+HRESULT (*CTaskListWnd_RedrawTaskFunc)(void* _this, void* pTaskGroup, void* pTaskItem, DWORD dwFlags) = NULL;
+HRESULT CTaskListWnd_RedrawTaskHook(void* _this, void* pTaskGroup, void* pTaskItem, DWORD dwFlags)
+{
+    if (pTaskItem && (dwFlags & 2) && dwTaskbarAutohideFlashBehavior == AUTOHIDEFLASH_SHOWONCE)
+    {
+        Win10TaskbarHooks_OnFlashNotification(pTaskItem);
+    }
+    void* pPrevRedrawTaskItem = g_pRedrawTaskItem;
+    g_pRedrawTaskItem = pTaskItem;
+    HRESULT hr = CTaskListWnd_RedrawTaskFunc(_this, pTaskGroup, pTaskItem, dwFlags);
+    g_pRedrawTaskItem = pPrevRedrawTaskItem;
+    return hr;
+}
+
+HRESULT (*CTaskBand_UnhideTrayFunc)(void* _this) = NULL;
+HRESULT CTaskBand_UnhideTrayHook(void* _this)
+{
+    // Only CTaskListWnd::RedrawTask()'s "flash on" branch unhides the tray from inside RedrawTask()
+    if (g_pRedrawTaskItem)
+    {
+        DWORD dwBehavior = dwTaskbarAutohideFlashBehavior;
+        if (dwBehavior == AUTOHIDEFLASH_NEVERSHOW
+            || (dwBehavior == AUTOHIDEFLASH_SHOWONCE && Win10TaskbarHooks_ShouldSuppressFlashUnhide(g_pRedrawTaskItem)))
+        {
+            return S_OK;
+        }
+    }
+    return CTaskBand_UnhideTrayFunc(_this);
+}
+
+void Win10TaskbarHooks_HookEPTaskbarAutoHide(HMODULE hModule)
+{
+    CTaskListWnd_PermitAutoHideFunc = (BOOL(*)(void*))GetProcAddress(hModule, "?PermitAutoHide@CTaskListWnd@@UEAAHXZ");
+    CTaskBtnGroup_IsFlashingFunc = (BOOL(*)(ITaskBtnGroup*))GetProcAddress(hModule, "?IsFlashing@CTaskBtnGroup@@UEAAHXZ");
+    if (CTaskListWnd_PermitAutoHideFunc && CTaskBtnGroup_IsFlashingFunc)
+    {
+        int rv = funchook_prepare(
+            funchook,
+            (void**)&CTaskBtnGroup_IsFlashingFunc,
+            CTaskBtnGroup_IsFlashingHook
+        );
+        if (rv == 0)
+        {
+            rv = funchook_prepare(
+                funchook,
+                (void**)&CTaskListWnd_PermitAutoHideFunc,
+                CTaskListWnd_PermitAutoHideHook
+            );
+        }
+        if (rv != 0)
+        {
+            printf("[TB] Failed to hook CTaskListWnd::PermitAutoHide() or CTaskBtnGroup::IsFlashing()\n");
+        }
+    }
+    else
+    {
+        printf("[TB] CTaskListWnd::PermitAutoHide() or CTaskBtnGroup::IsFlashing() not exported\n");
+    }
+
+    CTaskListWnd_RedrawTaskFunc = (HRESULT(*)(void*, void*, void*, DWORD))GetProcAddress(hModule, "?RedrawTask@CTaskListWnd@@UEAAJPEAUITaskGroup@@PEAUITaskItem@@K@Z");
+    CTaskBand_UnhideTrayFunc = (HRESULT(*)(void*))GetProcAddress(hModule, "?UnhideTray@CTaskBand@@UEAAJXZ");
+    if (CTaskListWnd_RedrawTaskFunc && CTaskBand_UnhideTrayFunc)
+    {
+        int rv = funchook_prepare(
+            funchook,
+            (void**)&CTaskBand_UnhideTrayFunc,
+            CTaskBand_UnhideTrayHook
+        );
+        if (rv == 0)
+        {
+            rv = funchook_prepare(
+                funchook,
+                (void**)&CTaskListWnd_RedrawTaskFunc,
+                CTaskListWnd_RedrawTaskHook
+            );
+        }
+        if (rv != 0)
+        {
+            printf("[TB] Failed to hook CTaskListWnd::RedrawTask() or CTaskBand::UnhideTray()\n");
+        }
+    }
+    else
+    {
+        printf("[TB] CTaskListWnd::RedrawTask() or CTaskBand::UnhideTray() not exported\n");
     }
 }
 #endif
@@ -6192,6 +6388,15 @@ void WINAPI LoadSettings(LPARAM lParam)
             0,
             NULL,
             &bTaskbarAutohideOnDoubleClick,
+            &dwSize
+        );
+        dwSize = sizeof(DWORD);
+        RegQueryValueExW(
+            hKey,
+            TEXT("TaskbarAutohideFlashBehavior"),
+            0,
+            NULL,
+            &dwTaskbarAutohideFlashBehavior,
             &dwSize
         );
         dwTemp = ORB_STYLE_WINDOWS10;
@@ -11656,6 +11861,7 @@ DWORD Inject(BOOL bIsExplorer)
         VnPatchIAT(hMyTaskbar, "uxtheme.dll", MAKEINTRESOURCEA(126), PeopleBand_DrawTextWithGlowHook);
 
         Win10TaskbarHooks_PatchEPTaskbarVtables(hMyTaskbar);
+        Win10TaskbarHooks_HookEPTaskbarAutoHide(hMyTaskbar);
     }
 
     HANDLE hCombase = LoadLibraryExW(L"combase.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
